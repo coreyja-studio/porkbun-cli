@@ -1,5 +1,7 @@
 mod client;
 
+use std::collections::HashMap;
+
 use clap::{Parser, Subcommand};
 use client::{Credentials, PorkbunClient};
 
@@ -27,6 +29,9 @@ use client::{Credentials, PorkbunClient};
 
     Get pricing for .dev domains:
         porkbun-cli pricing -t dev
+
+    Check domain availability matrix:
+        porkbun-cli matrix foo,bar --tlds com,dev,io
 
 AUTHENTICATION:
     Credentials are loaded from mnemon secrets manager:
@@ -76,6 +81,28 @@ OUTPUT:
         /// Filter by TLD (e.g., "com", "dev")
         #[arg(short, long)]
         tld: Option<String>,
+    },
+    /// Check domain availability across prefix × TLD combinations
+    #[command(after_help = "EXAMPLES:
+    Check multiple prefixes against multiple TLDs:
+        porkbun-cli matrix foo,bar,baz --tlds com,dev,io
+
+    Single prefix, multiple TLDs:
+        porkbun-cli matrix mysite --tlds com,net,org,io
+
+OUTPUT:
+    Shows a grid of availability with pricing:
+                  .com        .dev        .io
+    foo           $12.15      TAKEN       $39.99
+    bar           TAKEN       $15.00      $29.99 [P]")]
+    Matrix {
+        /// Comma-separated list of domain prefixes to check
+        #[arg(required = true, value_delimiter = ',')]
+        prefixes: Vec<String>,
+
+        /// Comma-separated list of TLDs to check (without dots)
+        #[arg(short, long, required = true, value_delimiter = ',')]
+        tlds: Vec<String>,
     },
 }
 
@@ -200,6 +227,71 @@ enum SslFormat {
     PrivateKey,
     /// Show only the public key
     PublicKey,
+}
+
+/// Result cell for matrix display
+enum MatrixCell {
+    Available { price: String, is_premium: bool },
+    Taken,
+    Error(String),
+}
+
+impl MatrixCell {
+    fn from_check(result: client::DomainCheckResponse) -> Self {
+        if result.avail.unwrap_or(false) {
+            MatrixCell::Available {
+                price: result.price.unwrap_or_else(|| "N/A".to_string()),
+                is_premium: result.premium.unwrap_or(false),
+            }
+        } else {
+            MatrixCell::Taken
+        }
+    }
+
+    fn display(&self) -> String {
+        match self {
+            MatrixCell::Available { price, is_premium } => {
+                if *is_premium {
+                    format!("${} [P]", price)
+                } else {
+                    format!("${}", price)
+                }
+            }
+            MatrixCell::Taken => "TAKEN".to_string(),
+            MatrixCell::Error(msg) => format!("ERR: {}", truncate(msg, 8)),
+        }
+    }
+}
+
+fn print_matrix_grid(
+    prefixes: &[String],
+    tlds: &[String],
+    results: &HashMap<String, HashMap<String, MatrixCell>>,
+) {
+    // Calculate column widths
+    let prefix_width = prefixes.iter().map(|p| p.len()).max().unwrap_or(8).max(8);
+    let cell_width = 12; // enough for "$1234.56 [P]"
+
+    // Header row
+    print!("{:width$}", "", width = prefix_width + 2);
+    for tld in tlds {
+        print!("{:>width$}", format!(".{}", tld), width = cell_width);
+    }
+    println!();
+
+    // Data rows
+    for prefix in prefixes {
+        print!("{:<width$}  ", prefix, width = prefix_width);
+        for tld in tlds {
+            let cell = results
+                .get(prefix)
+                .and_then(|m| m.get(tld))
+                .map(|c| c.display())
+                .unwrap_or_else(|| "???".to_string());
+            print!("{:>width$}", cell, width = cell_width);
+        }
+        println!();
+    }
 }
 
 #[tokio::main]
@@ -375,6 +467,71 @@ async fn run() -> Result<(), client::PorkbunError> {
                     );
                 }
             }
+        }
+        Commands::Matrix { prefixes, tlds } => {
+            // Porkbun rate limits to 1 check per 10 seconds
+            const RATE_LIMIT_WAIT: u64 = 11;
+
+            // Calculate total checks and estimate time
+            let total_checks = prefixes.len() * tlds.len();
+            let estimated_seconds = if total_checks > 1 {
+                (total_checks - 1) * RATE_LIMIT_WAIT as usize
+            } else {
+                0
+            };
+            let estimated_minutes = estimated_seconds / 60;
+            let remaining_seconds = estimated_seconds % 60;
+
+            if estimated_minutes > 0 {
+                eprintln!(
+                    "Checking {} domains (estimated ~{}m {}s)...\n",
+                    total_checks, estimated_minutes, remaining_seconds
+                );
+            } else {
+                eprintln!("Checking {} domains...\n", total_checks);
+            }
+
+            // Build results matrix (prefix -> tld -> result)
+            let mut results: HashMap<String, HashMap<String, MatrixCell>> = HashMap::new();
+            let mut check_count = 0;
+
+            for prefix in &prefixes {
+                results.insert(prefix.clone(), HashMap::new());
+
+                for tld in &tlds {
+                    // Rate limit wait (skip first)
+                    if check_count > 0 {
+                        eprintln!(
+                            "[{}/{}] Waiting {}s...",
+                            check_count, total_checks, RATE_LIMIT_WAIT
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(RATE_LIMIT_WAIT)).await;
+                    }
+                    check_count += 1;
+
+                    let domain = format!("{}.{}", prefix, tld);
+                    eprintln!("[{}/{}] Checking {}...", check_count, total_checks, domain);
+
+                    // Check with retry loop
+                    let cell = loop {
+                        match client.check_domain(&domain).await {
+                            Ok(result) => break MatrixCell::from_check(result),
+                            Err(client::PorkbunError::RateLimited { ttl, message }) => {
+                                eprintln!("  Rate limited: {} - waiting {}s...", message, ttl + 1);
+                                tokio::time::sleep(std::time::Duration::from_secs(ttl + 1)).await;
+                                continue;
+                            }
+                            Err(e) => break MatrixCell::Error(e.to_string()),
+                        }
+                    };
+
+                    results.get_mut(prefix).unwrap().insert(tld.clone(), cell);
+                }
+            }
+
+            // Print grid
+            eprintln!(); // blank line before results
+            print_matrix_grid(&prefixes, &tlds, &results);
         }
     }
 
