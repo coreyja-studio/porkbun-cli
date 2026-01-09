@@ -15,6 +15,12 @@ struct Cli {
 enum Commands {
     /// Check API connectivity and show your IP
     Ping,
+    /// Check if a domain is available for registration
+    Check {
+        /// Domain(s) to check availability for (e.g., "example.com")
+        #[arg(required = true)]
+        domains: Vec<String>,
+    },
     /// DNS record management
     Dns {
         #[command(subcommand)]
@@ -134,6 +140,34 @@ async fn run() -> Result<(), client::PorkbunError> {
             let resp = client.ping().await?;
             println!("API connection successful");
             println!("Your IP: {}", resp.your_ip);
+        }
+        Commands::Check { domains } => {
+            for domain in &domains {
+                match client.check_domain(domain).await {
+                    Ok(result) => {
+                        let available = result.avail.unwrap_or(false);
+                        let status = if available { "AVAILABLE" } else { "TAKEN" };
+
+                        if available {
+                            let price = result.price.as_deref().unwrap_or("N/A");
+                            let renewal = result.renewal_price.as_deref().unwrap_or("N/A");
+                            let premium_tag = if result.premium.unwrap_or(false) {
+                                " [PREMIUM]"
+                            } else {
+                                ""
+                            };
+                            println!(
+                                "{domain}: {status}{premium_tag} - ${price} (renewal: ${renewal})"
+                            );
+                        } else {
+                            println!("{domain}: {status}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{domain}: Error - {e}");
+                    }
+                }
+            }
         }
         Commands::Dns { command } => match command {
             DnsCommands::List { domain } => {

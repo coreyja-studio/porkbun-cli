@@ -145,6 +145,18 @@ pub struct PricingResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct DomainCheckResponse {
+    #[serde(default)]
+    pub avail: Option<bool>,
+    #[serde(default)]
+    pub price: Option<String>,
+    #[serde(default)]
+    pub premium: Option<bool>,
+    #[serde(rename = "renewalPrice", default)]
+    pub renewal_price: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct TldPricing {
     pub registration: String,
@@ -349,5 +361,25 @@ impl PorkbunClient {
         }
 
         Ok(resp.data.map(|d| d.pricing).unwrap_or_default())
+    }
+
+    pub async fn check_domain(&self, domain: &str) -> Result<DomainCheckResponse, PorkbunError> {
+        let resp: ApiResponse<DomainCheckResponse> = self
+            .client
+            .post(format!("{API_BASE}/domain/checkDomain/{domain}"))
+            .json(&self.auth_body())
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        if resp.status != "SUCCESS" {
+            return Err(PorkbunError::Api(
+                resp.message.unwrap_or_else(|| "Unknown error".to_string()),
+            ));
+        }
+
+        resp.data
+            .ok_or_else(|| PorkbunError::Api("No data in response".to_string()))
     }
 }
