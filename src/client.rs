@@ -217,20 +217,51 @@ pub struct PricingResponse {
     pub pricing: std::collections::HashMap<String, TldPricing>,
 }
 
-/// Domain availability check result.
+/// Response wrapper for domain check endpoint.
 #[derive(Debug, Deserialize)]
-pub struct DomainCheckResponse {
-    /// Whether the domain is available for registration
+pub struct DomainCheckApiResponse {
+    pub response: DomainCheckData,
+}
+
+/// Domain availability check result from the API.
+#[derive(Debug, Deserialize)]
+pub struct DomainCheckData {
+    /// Whether the domain is available ("yes" or "no")
     #[serde(default)]
-    pub avail: Option<bool>,
+    pub avail: Option<String>,
     /// Registration price in USD (only set if available)
     #[serde(default)]
     pub price: Option<String>,
-    /// Whether this is a premium domain with special pricing
+    /// Whether this is a premium domain ("yes" or "no")
     #[serde(default)]
+    pub premium: Option<String>,
+    /// Additional pricing info including renewal
+    #[serde(default)]
+    pub additional: Option<AdditionalPricing>,
+}
+
+/// Additional pricing information (renewal, transfer).
+#[derive(Debug, Deserialize)]
+pub struct AdditionalPricing {
+    pub renewal: Option<RenewalPricing>,
+}
+
+/// Renewal pricing details.
+#[derive(Debug, Deserialize)]
+pub struct RenewalPricing {
+    pub price: Option<String>,
+}
+
+/// Parsed domain availability result for caller convenience.
+#[derive(Debug)]
+pub struct DomainCheckResponse {
+    /// Whether the domain is available for registration
+    pub avail: Option<bool>,
+    /// Registration price in USD (only set if available)
+    pub price: Option<String>,
+    /// Whether this is a premium domain with special pricing
     pub premium: Option<bool>,
     /// Annual renewal price in USD (only set if available)
-    #[serde(rename = "renewalPrice", default)]
     pub renewal_price: Option<String>,
 }
 
@@ -524,7 +555,7 @@ impl PorkbunClient {
     /// Domain checks are rate limited by Porkbun. You will be notified
     /// of your limit when you cross it.
     pub async fn check_domain(&self, domain: &str) -> Result<DomainCheckResponse, PorkbunError> {
-        let resp: ApiResponse<DomainCheckResponse> = self
+        let resp: ApiResponse<DomainCheckApiResponse> = self
             .client
             .post(format!("{API_BASE}/domain/checkDomain/{domain}"))
             .json(&self.auth_body())
@@ -539,7 +570,21 @@ impl PorkbunClient {
             ));
         }
 
-        resp.data
-            .ok_or_else(|| PorkbunError::Api("No data in response".to_string()))
+        let data = resp
+            .data
+            .ok_or_else(|| PorkbunError::Api("No data in response".to_string()))?;
+
+        let response = data.response;
+        let renewal_price = response
+            .additional
+            .and_then(|a| a.renewal)
+            .and_then(|r| r.price);
+
+        Ok(DomainCheckResponse {
+            avail: response.avail.map(|s| s == "yes"),
+            price: response.price,
+            premium: response.premium.map(|s| s == "yes"),
+            renewal_price,
+        })
     }
 }
