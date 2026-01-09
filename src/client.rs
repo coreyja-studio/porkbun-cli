@@ -8,8 +8,8 @@
 //! Credentials are loaded from the mnemon secrets manager:
 //!
 //! ```bash
-//! mnemon secrets get porkbun-api api-key
-//! mnemon secrets get porkbun-api secret-key
+//! mnemon secrets get porkbun-api --field api-key
+//! mnemon secrets get porkbun-api --field secret-key
 //! ```
 //!
 //! # Example
@@ -78,7 +78,7 @@ impl Credentials {
     /// Returns an error if mnemon is not available or the secret doesn't exist.
     pub fn from_mnemon() -> Result<Self, PorkbunError> {
         let api_key = std::process::Command::new("mnemon")
-            .args(["secrets", "get", "porkbun-api", "api-key"])
+            .args(["secrets", "get", "porkbun-api", "--field", "api-key"])
             .output()
             .map_err(|e| PorkbunError::Credentials(e.to_string()))?;
 
@@ -89,7 +89,7 @@ impl Credentials {
         }
 
         let secret_key = std::process::Command::new("mnemon")
-            .args(["secrets", "get", "porkbun-api", "secret-key"])
+            .args(["secrets", "get", "porkbun-api", "--field", "secret-key"])
             .output()
             .map_err(|e| PorkbunError::Credentials(e.to_string()))?;
 
