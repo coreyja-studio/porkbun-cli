@@ -223,8 +223,17 @@ async fn run() -> Result<(), client::PorkbunError> {
             println!("Your IP: {}", resp.your_ip);
         }
         Commands::Check { domains } => {
-            for domain in &domains {
-                // Retry loop for rate limiting
+            // Porkbun rate limits to 1 check per 10 seconds
+            const RATE_LIMIT_WAIT: u64 = 11;
+
+            for (i, domain) in domains.iter().enumerate() {
+                // Proactive wait between domains (skip for first domain)
+                if i > 0 {
+                    eprintln!("Waiting {RATE_LIMIT_WAIT}s for rate limit...");
+                    tokio::time::sleep(std::time::Duration::from_secs(RATE_LIMIT_WAIT)).await;
+                }
+
+                // Retry loop for rate limiting (reactive wait if we still hit it)
                 let result = loop {
                     match client.check_domain(domain).await {
                         Ok(result) => break Ok(result),

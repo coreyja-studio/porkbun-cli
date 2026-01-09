@@ -231,24 +231,6 @@ pub struct DomainCheckApiResponse {
     /// Domain check result (may be absent when rate limited)
     #[serde(default)]
     pub response: Option<DomainCheckData>,
-    /// Rate limit information (present when limits are being enforced)
-    #[serde(default)]
-    pub limits: Option<RateLimits>,
-}
-
-/// Rate limit information from the API.
-#[derive(Debug, Deserialize)]
-pub struct RateLimits {
-    /// Time-to-live in seconds until the rate limit resets
-    #[serde(rename = "TTL")]
-    pub ttl: String,
-    /// Maximum allowed requests in the window
-    pub limit: String,
-    /// Number of requests used in the current window
-    pub used: u64,
-    /// Human-readable description of the limit
-    #[serde(rename = "naturalLanguage")]
-    pub natural_language: String,
 }
 
 /// Domain availability check result from the API.
@@ -592,24 +574,16 @@ impl PorkbunClient {
             .json()
             .await?;
 
-        // Check for rate limiting first (can occur on both success and error)
-        if let Some(data) = &resp.data
-            && let Some(limits) = &data.limits
-        {
-            let limit: u64 = limits.limit.parse().unwrap_or(1);
-            if limits.used >= limit {
-                let ttl: u64 = limits.ttl.parse().unwrap_or(10);
-                return Err(PorkbunError::RateLimited {
-                    ttl,
-                    message: limits.natural_language.clone(),
-                });
-            }
-        }
-
         if resp.status != "SUCCESS" {
-            return Err(PorkbunError::Api(
-                resp.message.unwrap_or_else(|| "Unknown error".to_string()),
-            ));
+            let message = resp.message.unwrap_or_else(|| "Unknown error".to_string());
+            // Detect rate limiting from error message pattern
+            // Format: "X out of Y checks within Z seconds used."
+            if message.contains("checks within") && message.contains("seconds used") {
+                // Parse TTL from the message, default to 10 seconds
+                let ttl = Self::parse_rate_limit_ttl(&message).unwrap_or(10);
+                return Err(PorkbunError::RateLimited { ttl, message });
+            }
+            return Err(PorkbunError::Api(message));
         }
 
         let data = resp
@@ -631,5 +605,16 @@ impl PorkbunClient {
             premium: response.premium.map(|s| s == "yes"),
             renewal_price,
         })
+    }
+
+    /// Parse the TTL from a rate limit error message.
+    /// Format: "X out of Y checks within Z seconds used."
+    fn parse_rate_limit_ttl(message: &str) -> Option<u64> {
+        // Find "within X seconds" pattern
+        let within_idx = message.find("within ")?;
+        let after_within = &message[within_idx + 7..];
+        let seconds_idx = after_within.find(" seconds")?;
+        let ttl_str = &after_within[..seconds_idx];
+        ttl_str.trim().parse().ok()
     }
 }
