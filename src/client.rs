@@ -52,6 +52,14 @@ pub enum PorkbunError {
     /// API returned an error response
     #[error("API error: {0}")]
     Api(String),
+    /// Rate limited - wait the specified seconds before retrying
+    #[error("Rate limited: wait {ttl} seconds ({message})")]
+    RateLimited {
+        /// Seconds to wait before retrying
+        ttl: u64,
+        /// Human-readable description of the limit
+        message: String,
+    },
     /// Failed to load credentials from mnemon
     #[error("Failed to get credentials: {0}")]
     Credentials(String),
@@ -220,7 +228,27 @@ pub struct PricingResponse {
 /// Response wrapper for domain check endpoint.
 #[derive(Debug, Deserialize)]
 pub struct DomainCheckApiResponse {
-    pub response: DomainCheckData,
+    /// Domain check result (may be absent when rate limited)
+    #[serde(default)]
+    pub response: Option<DomainCheckData>,
+    /// Rate limit information (present when limits are being enforced)
+    #[serde(default)]
+    pub limits: Option<RateLimits>,
+}
+
+/// Rate limit information from the API.
+#[derive(Debug, Deserialize)]
+pub struct RateLimits {
+    /// Time-to-live in seconds until the rate limit resets
+    #[serde(rename = "TTL")]
+    pub ttl: String,
+    /// Maximum allowed requests in the window
+    pub limit: String,
+    /// Number of requests used in the current window
+    pub used: u64,
+    /// Human-readable description of the limit
+    #[serde(rename = "naturalLanguage")]
+    pub natural_language: String,
 }
 
 /// Domain availability check result from the API.
@@ -552,8 +580,8 @@ impl PorkbunClient {
     ///
     /// # Rate Limiting
     ///
-    /// Domain checks are rate limited by Porkbun. You will be notified
-    /// of your limit when you cross it.
+    /// Domain checks are rate limited by Porkbun (1 per 10 seconds).
+    /// Returns `PorkbunError::RateLimited` with TTL when limit is exceeded.
     pub async fn check_domain(&self, domain: &str) -> Result<DomainCheckResponse, PorkbunError> {
         let resp: ApiResponse<DomainCheckApiResponse> = self
             .client
@@ -563,6 +591,20 @@ impl PorkbunClient {
             .await?
             .json()
             .await?;
+
+        // Check for rate limiting first (can occur on both success and error)
+        if let Some(data) = &resp.data
+            && let Some(limits) = &data.limits
+        {
+            let limit: u64 = limits.limit.parse().unwrap_or(1);
+            if limits.used >= limit {
+                let ttl: u64 = limits.ttl.parse().unwrap_or(10);
+                return Err(PorkbunError::RateLimited {
+                    ttl,
+                    message: limits.natural_language.clone(),
+                });
+            }
+        }
 
         if resp.status != "SUCCESS" {
             return Err(PorkbunError::Api(
@@ -574,7 +616,10 @@ impl PorkbunClient {
             .data
             .ok_or_else(|| PorkbunError::Api("No data in response".to_string()))?;
 
-        let response = data.response;
+        let response = data
+            .response
+            .ok_or_else(|| PorkbunError::Api("No response data".to_string()))?;
+
         let renewal_price = response
             .additional
             .and_then(|a| a.renewal)

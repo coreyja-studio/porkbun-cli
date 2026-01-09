@@ -224,7 +224,21 @@ async fn run() -> Result<(), client::PorkbunError> {
         }
         Commands::Check { domains } => {
             for domain in &domains {
-                match client.check_domain(domain).await {
+                // Retry loop for rate limiting
+                let result = loop {
+                    match client.check_domain(domain).await {
+                        Ok(result) => break Ok(result),
+                        Err(client::PorkbunError::RateLimited { ttl, message }) => {
+                            let wait = ttl + 1; // Add buffer to avoid edge cases
+                            eprintln!("{domain}: {message} - waiting {wait}s...");
+                            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                            continue;
+                        }
+                        Err(e) => break Err(e),
+                    }
+                };
+
+                match result {
                     Ok(result) => {
                         let available = result.avail.unwrap_or(false);
                         let status = if available { "AVAILABLE" } else { "TAKEN" };
@@ -336,7 +350,10 @@ async fn run() -> Result<(), client::PorkbunError> {
                     println!("TLD .{tld_filter} not found");
                 }
             } else {
-                println!("{:<15} {:>12} {:>12} {:>12}", "TLD", "REGISTER", "RENEW", "TRANSFER");
+                println!(
+                    "{:<15} {:>12} {:>12} {:>12}",
+                    "TLD", "REGISTER", "RENEW", "TRANSFER"
+                );
                 println!("{}", "-".repeat(55));
 
                 let mut tlds: Vec<_> = pricing.iter().collect();
