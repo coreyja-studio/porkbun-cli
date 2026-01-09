@@ -30,8 +30,8 @@ use client::{Credentials, PorkbunClient};
 
 AUTHENTICATION:
     Credentials are loaded from mnemon secrets manager:
-        mnemon secrets get porkbun-api api-key
-        mnemon secrets get porkbun-api secret-key")]
+        mnemon secrets get porkbun-api --field api-key
+        mnemon secrets get porkbun-api --field secret-key")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
