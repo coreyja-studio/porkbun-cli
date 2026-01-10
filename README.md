@@ -1,3 +1,5 @@
+![Porkbun CLI Header](header.png)
+
 # porkbun-cli
 
 A Rust CLI for interacting with the [Porkbun](https://porkbun.com) DNS API.
