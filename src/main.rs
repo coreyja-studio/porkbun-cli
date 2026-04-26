@@ -39,6 +39,12 @@ use client::{Credentials, PorkbunClient};
     List domains as JSON:
         porkbun-cli list --json
 
+    Show details for a single domain:
+        porkbun-cli info example.com
+
+    Show single-domain details as JSON:
+        porkbun-cli info example.com --json
+
 AUTHENTICATION:
     Credentials are loaded from mnemon secrets manager:
         mnemon secrets get porkbun-api --field api-key
@@ -131,6 +137,21 @@ OUTPUT:
         /// Include domain labels in the output
         #[arg(long)]
         labels: bool,
+    },
+    /// Show detailed info for a single owned domain
+    #[command(after_help = "EXAMPLES:
+    Show summary for a domain you own:
+        porkbun-cli info coreyja.com
+
+    Emit JSON for scripting:
+        porkbun-cli info coreyja.com --json")]
+    Info {
+        /// The domain to show info for (must be in your Porkbun account)
+        #[arg(required = true)]
+        domain: String,
+        /// Output as JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -576,6 +597,22 @@ async fn run() -> Result<(), client::PorkbunError> {
                 print_domain_table(&domains, labels);
             }
         }
+        Commands::Info { domain, json } => {
+            let domains = client.list_domains(true).await?;
+            let domain_lc = domain.to_lowercase();
+            let entry = domains
+                .into_iter()
+                .find(|d| d.domain.to_lowercase() == domain_lc)
+                .ok_or_else(|| client::PorkbunError::DomainNotFound(domain.clone()))?;
+
+            let nameservers = client.get_ns(&entry.domain).await?;
+
+            if json {
+                print_domain_info_json(&entry, &nameservers)?;
+            } else {
+                print_domain_info(&entry, &nameservers);
+            }
+        }
     }
 
     Ok(())
@@ -671,6 +708,81 @@ fn print_domain_table(domains: &[client::Domain], show_labels: bool) {
             );
         }
     }
+}
+
+fn print_domain_info(d: &client::Domain, nameservers: &[String]) {
+    const LABEL_WIDTH: usize = 16;
+
+    println!("Domain: {}", d.domain);
+    println!("  {:<w$}{}", "Status:", d.status, w = LABEL_WIDTH);
+
+    let expires = d
+        .expire_date
+        .split_whitespace()
+        .next()
+        .unwrap_or(&d.expire_date);
+    println!("  {:<w$}{}", "Expires:", expires, w = LABEL_WIDTH);
+
+    println!(
+        "  {:<w$}{}",
+        "Auto-Renew:",
+        format_yn(&d.auto_renew),
+        w = LABEL_WIDTH
+    );
+    println!(
+        "  {:<w$}{}",
+        "Whois Privacy:",
+        format_yn(&d.whois_privacy),
+        w = LABEL_WIDTH
+    );
+    println!(
+        "  {:<w$}{}",
+        "Security Lock:",
+        format_yn(&d.security_lock),
+        w = LABEL_WIDTH
+    );
+
+    if let Some(labels) = d.labels.as_ref()
+        && !labels.is_empty()
+    {
+        let joined = labels
+            .iter()
+            .map(|l| l.title.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  {:<w$}{}", "Labels:", joined, w = LABEL_WIDTH);
+    }
+
+    if nameservers.is_empty() {
+        println!("  {:<w$}(none)", "Nameservers:", w = LABEL_WIDTH);
+    } else {
+        println!("  Nameservers:");
+        for ns in nameservers {
+            println!("    - {ns}");
+        }
+    }
+}
+
+fn print_domain_info_json(
+    d: &client::Domain,
+    nameservers: &[String],
+) -> Result<(), client::PorkbunError> {
+    #[derive(serde::Serialize)]
+    struct DomainInfoJson<'a> {
+        #[serde(flatten)]
+        domain: &'a client::Domain,
+        nameservers: &'a [String],
+    }
+
+    let payload = DomainInfoJson {
+        domain: d,
+        nameservers,
+    };
+
+    let out = serde_json::to_string_pretty(&payload)
+        .map_err(|e| client::PorkbunError::Api(format!("JSON serialization failed: {e}")))?;
+    println!("{out}");
+    Ok(())
 }
 
 /// Render a `serde_json::Value` that may be a string ("1"/"0"/"yes"/"no"),
