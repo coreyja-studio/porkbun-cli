@@ -33,6 +33,12 @@ use client::{Credentials, PorkbunClient};
     Check domain availability matrix:
         porkbun-cli matrix foo,bar --tlds com,dev,io
 
+    List all owned domains:
+        porkbun-cli list
+
+    List domains as JSON:
+        porkbun-cli list --json
+
 AUTHENTICATION:
     Credentials are loaded from mnemon secrets manager:
         mnemon secrets get porkbun-api --field api-key
@@ -103,6 +109,28 @@ OUTPUT:
         /// Comma-separated list of TLDs to check (without dots)
         #[arg(short, long, required = true, value_delimiter = ',')]
         tlds: Vec<String>,
+    },
+    /// List all domains in your Porkbun account
+    #[command(alias = "ls")]
+    #[command(after_help = "EXAMPLES:
+    Show owned domains as a table:
+        porkbun-cli list
+
+    Short alias:
+        porkbun-cli ls
+
+    Emit raw JSON for scripting:
+        porkbun-cli list --json
+
+    Include domain labels:
+        porkbun-cli list --labels")]
+    List {
+        /// Output as JSON instead of a table
+        #[arg(long)]
+        json: bool,
+        /// Include domain labels in the output
+        #[arg(long)]
+        labels: bool,
     },
 }
 
@@ -533,9 +561,143 @@ async fn run() -> Result<(), client::PorkbunError> {
             eprintln!(); // blank line before results
             print_matrix_grid(&prefixes, &tlds, &results);
         }
+        Commands::List { json, labels } => {
+            let mut domains = client.list_domains(labels).await?;
+            domains.sort_by_key(|d| d.domain.to_lowercase());
+
+            if json {
+                let out = serde_json::to_string_pretty(&domains).map_err(|e| {
+                    client::PorkbunError::Api(format!("JSON serialization failed: {e}"))
+                })?;
+                println!("{out}");
+            } else if domains.is_empty() {
+                println!("No domains found in account");
+            } else {
+                print_domain_table(&domains, labels);
+            }
+        }
     }
 
     Ok(())
+}
+
+fn print_domain_table(domains: &[client::Domain], show_labels: bool) {
+    let domain_w = domains
+        .iter()
+        .map(|d| d.domain.len())
+        .max()
+        .unwrap_or(20)
+        .max(20);
+    let status_w = 10;
+    let expire_w = 20;
+    let renew_w = 10;
+    let priv_w = 10;
+
+    if show_labels {
+        println!(
+            "{:<dw$} {:<sw$} {:<ew$} {:<rw$} {:<pw$} LABELS",
+            "DOMAIN",
+            "STATUS",
+            "EXPIRES",
+            "AUTORENEW",
+            "WHOIS",
+            dw = domain_w,
+            sw = status_w,
+            ew = expire_w,
+            rw = renew_w,
+            pw = priv_w
+        );
+    } else {
+        println!(
+            "{:<dw$} {:<sw$} {:<ew$} {:<rw$} {:<pw$}",
+            "DOMAIN",
+            "STATUS",
+            "EXPIRES",
+            "AUTORENEW",
+            "WHOIS",
+            dw = domain_w,
+            sw = status_w,
+            ew = expire_w,
+            rw = renew_w,
+            pw = priv_w
+        );
+    }
+    let sep_len =
+        domain_w + status_w + expire_w + renew_w + priv_w + 4 + if show_labels { 16 } else { 0 };
+    println!("{}", "-".repeat(sep_len));
+
+    for d in domains {
+        let auto_renew = format_yn(&d.auto_renew);
+        let whois = format_yn(&d.whois_privacy);
+
+        if show_labels {
+            let labels_str = d
+                .labels
+                .as_ref()
+                .map(|ls| {
+                    ls.iter()
+                        .map(|l| l.title.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            println!(
+                "{:<dw$} {:<sw$} {:<ew$} {:<rw$} {:<pw$} {}",
+                d.domain,
+                d.status,
+                d.expire_date,
+                auto_renew,
+                whois,
+                labels_str,
+                dw = domain_w,
+                sw = status_w,
+                ew = expire_w,
+                rw = renew_w,
+                pw = priv_w
+            );
+        } else {
+            println!(
+                "{:<dw$} {:<sw$} {:<ew$} {:<rw$} {:<pw$}",
+                d.domain,
+                d.status,
+                d.expire_date,
+                auto_renew,
+                whois,
+                dw = domain_w,
+                sw = status_w,
+                ew = expire_w,
+                rw = renew_w,
+                pw = priv_w
+            );
+        }
+    }
+}
+
+/// Render a `serde_json::Value` that may be a string ("1"/"0"/"yes"/"no"),
+/// integer (1/0), or bool — into a human-readable yes/no.
+///
+/// Returns `"?"` for `Null` or unexpected variants.
+fn format_yn(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::String(s) => match s.as_str() {
+            "1" | "yes" | "true" => "yes",
+            "0" | "no" | "false" => "no",
+            _ => "?",
+        },
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(1) => "yes",
+            Some(0) => "no",
+            _ => "?",
+        },
+        serde_json::Value::Bool(b) => {
+            if *b {
+                "yes"
+            } else {
+                "no"
+            }
+        }
+        _ => "?",
+    }
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
