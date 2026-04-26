@@ -10,6 +10,7 @@ A Rust CLI for interacting with the [Porkbun](https://porkbun.com) DNS API.
 - SSL certificate retrieval
 - Domain pricing information
 - API ping/health check
+- Domain account listing
 
 ## Installation
 
@@ -37,6 +38,12 @@ porkbun-cli ssl get example.com
 
 # Get domain pricing
 porkbun-cli pricing
+
+# List all domains in your account
+porkbun-cli list
+
+# As JSON for scripting
+porkbun-cli list --json
 ```
 
 ## Configuration

@@ -152,6 +152,17 @@ struct UpdateRecordBody {
     prio: Option<u32>,
 }
 
+#[derive(Serialize)]
+struct ListAllBody {
+    apikey: String,
+    secretapikey: String,
+    /// Pagination offset (omit for the first page).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<u64>,
+    #[serde(rename = "includeLabels", skip_serializing_if = "Option::is_none")]
+    include_labels: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ApiResponse<T> {
     pub status: String,
@@ -165,6 +176,51 @@ pub struct ApiResponse<T> {
 #[derive(Debug, Deserialize)]
 pub struct DnsRecordsResponse {
     pub records: Vec<DnsRecord>,
+}
+
+/// Response wrapper for the domain list endpoint.
+#[derive(Debug, Deserialize)]
+pub struct DomainListResponse {
+    #[serde(default)]
+    pub domains: Vec<Domain>,
+}
+
+/// A registered domain returned by `domain/listAll`.
+///
+/// Note: `security_lock`, `whois_privacy`, `auto_renew`, and `not_local`
+/// use `serde_json::Value` because the Porkbun API has been observed
+/// returning these boolean-ish fields as strings (`"1"`/`"0"`/`"yes"`/`"no"`)
+/// in some responses and integers/booleans in others. Render them via
+/// `format_yn` in the CLI layer.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[allow(dead_code)]
+pub struct Domain {
+    pub domain: String,
+    pub status: String,
+    pub tld: String,
+    #[serde(rename = "createDate")]
+    pub create_date: String,
+    #[serde(rename = "expireDate")]
+    pub expire_date: String,
+    #[serde(rename = "securityLock")]
+    pub security_lock: serde_json::Value,
+    #[serde(rename = "whoisPrivacy")]
+    pub whois_privacy: serde_json::Value,
+    #[serde(rename = "autoRenew")]
+    pub auto_renew: serde_json::Value,
+    #[serde(rename = "notLocal")]
+    pub not_local: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<DomainLabel>>,
+}
+
+/// A user-defined label applied to a domain.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[allow(dead_code)]
+pub struct DomainLabel {
+    pub id: String,
+    pub title: String,
+    pub color: String,
 }
 
 /// A DNS record from the Porkbun API.
@@ -549,6 +605,66 @@ impl PorkbunClient {
         }
 
         Ok(resp.data.map(|d| d.pricing).unwrap_or_default())
+    }
+
+    /// List all domains in the account.
+    ///
+    /// Automatically paginates through all results (the API returns up to
+    /// 1000 domains per page). Returns a single combined list.
+    pub async fn list_domains(&self, include_labels: bool) -> Result<Vec<Domain>, PorkbunError> {
+        const PAGE_SIZE: usize = 1000;
+        const MAX_PAGES: usize = 100;
+
+        let mut all_domains: Vec<Domain> = Vec::new();
+        let mut start: u64 = 0;
+
+        for page_num in 0..MAX_PAGES {
+            let body = ListAllBody {
+                apikey: self.credentials.api_key.clone(),
+                secretapikey: self.credentials.secret_key.clone(),
+                start: if start == 0 { None } else { Some(start) },
+                include_labels: if include_labels {
+                    Some("yes".to_string())
+                } else {
+                    None
+                },
+            };
+
+            let resp: ApiResponse<DomainListResponse> = self
+                .client
+                .post(format!("{API_BASE}/domain/listAll"))
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?;
+
+            if resp.status != "SUCCESS" {
+                return Err(PorkbunError::Api(
+                    resp.message.unwrap_or_else(|| "Unknown error".to_string()),
+                ));
+            }
+
+            let page = resp.data.map(|d| d.domains).unwrap_or_default();
+            let page_len = page.len();
+            all_domains.extend(page);
+
+            if page_len < PAGE_SIZE {
+                return Ok(all_domains);
+            }
+
+            start += PAGE_SIZE as u64;
+
+            if page_num + 1 >= MAX_PAGES {
+                return Err(PorkbunError::Api(format!(
+                    "Pagination exceeded MAX_PAGES ({MAX_PAGES}); server may not be honoring `start`"
+                )));
+            }
+        }
+
+        Err(PorkbunError::Api(format!(
+            "Pagination exceeded MAX_PAGES ({MAX_PAGES})"
+        )))
     }
 
     /// Check if a domain is available for registration.
