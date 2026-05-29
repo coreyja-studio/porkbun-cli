@@ -52,6 +52,9 @@ pub enum PorkbunError {
     /// API returned an error response
     #[error("API error: {0}")]
     Api(String),
+    /// Domain was not found in the account
+    #[error("domain '{0}' not found in your Porkbun account")]
+    DomainNotFound(String),
     /// Rate limited - wait the specified seconds before retrying
     #[error("Rate limited: wait {ttl} seconds ({message})")]
     RateLimited {
@@ -183,6 +186,13 @@ pub struct DnsRecordsResponse {
 pub struct DomainListResponse {
     #[serde(default)]
     pub domains: Vec<Domain>,
+}
+
+/// Response wrapper for the nameservers (`getNs`) endpoint.
+#[derive(Debug, Deserialize)]
+pub struct NameserversResponse {
+    #[serde(default)]
+    pub ns: Vec<String>,
 }
 
 /// A registered domain returned by `domain/listAll`.
@@ -665,6 +675,34 @@ impl PorkbunClient {
         Err(PorkbunError::Api(format!(
             "Pagination exceeded MAX_PAGES ({MAX_PAGES})"
         )))
+    }
+
+    /// Get the current nameservers for a domain.
+    ///
+    /// # Arguments
+    ///
+    /// * `domain` - The domain to fetch nameservers for (must be in your account)
+    ///
+    /// # Returns
+    ///
+    /// A list of nameserver hostnames, or an empty list if none are set.
+    pub async fn get_ns(&self, domain: &str) -> Result<Vec<String>, PorkbunError> {
+        let resp: ApiResponse<NameserversResponse> = self
+            .client
+            .post(format!("{API_BASE}/domain/getNs/{domain}"))
+            .json(&self.auth_body())
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        if resp.status != "SUCCESS" {
+            return Err(PorkbunError::Api(
+                resp.message.unwrap_or_else(|| "Unknown error".to_string()),
+            ));
+        }
+
+        Ok(resp.data.map(|d| d.ns).unwrap_or_default())
     }
 
     /// Check if a domain is available for registration.
