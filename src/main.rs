@@ -1,6 +1,7 @@
 mod client;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use clap::{Parser, Subcommand};
 use client::{Credentials, PorkbunClient};
@@ -106,7 +107,8 @@ OUTPUT:
     Shows a grid of availability with pricing:
                   .com        .dev        .io
     foo           $12.15      TAKEN       $39.99
-    bar           TAKEN       $15.00      $29.99 [P]")]
+    bar           TAKEN       $15.00      $29.99 [P]
+    coreyja       OWNED       $15.00      $39.99")]
     Matrix {
         /// Comma-separated list of domain prefixes to check
         #[arg(required = true, value_delimiter = ',')]
@@ -282,6 +284,7 @@ enum SslFormat {
 enum MatrixCell {
     Available { price: String, is_premium: bool },
     Taken,
+    Owned,
     Error(String),
 }
 
@@ -307,9 +310,18 @@ impl MatrixCell {
                 }
             }
             MatrixCell::Taken => "TAKEN".to_string(),
+            MatrixCell::Owned => "OWNED".to_string(),
             MatrixCell::Error(msg) => format!("ERR: {}", truncate(msg, 8)),
         }
     }
+}
+
+/// Build a set of lowercased full domain names from a list of owned domains.
+///
+/// Used by the matrix subcommand to short-circuit per-cell availability
+/// checks when the user already owns the domain.
+fn build_owned_set(domains: &[client::Domain]) -> HashSet<String> {
+    domains.iter().map(|d| d.domain.to_lowercase()).collect()
 }
 
 fn print_matrix_grid(
@@ -521,45 +533,82 @@ async fn run() -> Result<(), client::PorkbunError> {
             // Porkbun rate limits to 1 check per 10 seconds
             const RATE_LIMIT_WAIT: u64 = 11;
 
-            // Calculate total checks and estimate time
-            let total_checks = prefixes.len() * tlds.len();
-            let estimated_seconds = if total_checks > 1 {
-                (total_checks - 1) * RATE_LIMIT_WAIT as usize
-            } else {
-                0
-            };
+            // Fetch owned domains once. include_labels=false (we only need the names).
+            eprintln!("Fetching owned domains...");
+            let owned_domains = client.list_domains(false).await?;
+            let owned_set = build_owned_set(&owned_domains);
+
+            // Compute how many cells will actually require an API check.
+            let total_cells = prefixes.len() * tlds.len();
+            let mut owned_cells = 0usize;
+            for prefix in &prefixes {
+                for tld in &tlds {
+                    let candidate = format!("{}.{}", prefix, tld).to_lowercase();
+                    if owned_set.contains(&candidate) {
+                        owned_cells += 1;
+                    }
+                }
+            }
+            let api_checks = total_cells - owned_cells;
+
+            // Estimate based on actual API checks, not total cells.
+            let estimated_seconds = api_checks.saturating_sub(1) * RATE_LIMIT_WAIT as usize;
             let estimated_minutes = estimated_seconds / 60;
             let remaining_seconds = estimated_seconds % 60;
 
-            if estimated_minutes > 0 {
+            if owned_cells > 0 {
                 eprintln!(
-                    "Checking {} domains (estimated ~{}m {}s)...\n",
-                    total_checks, estimated_minutes, remaining_seconds
+                    "Checking {} domains ({} already owned, skipped)...",
+                    total_cells, owned_cells
                 );
             } else {
-                eprintln!("Checking {} domains...\n", total_checks);
+                eprintln!("Checking {} domains...", total_cells);
+            }
+            if estimated_minutes > 0 {
+                eprintln!(
+                    "Estimated ~{}m {}s for API checks.\n",
+                    estimated_minutes, remaining_seconds
+                );
+            } else if estimated_seconds > 0 {
+                eprintln!("Estimated ~{}s for API checks.\n", estimated_seconds);
+            } else {
+                eprintln!();
             }
 
             // Build results matrix (prefix -> tld -> result)
             let mut results: HashMap<String, HashMap<String, MatrixCell>> = HashMap::new();
-            let mut check_count = 0;
+            let mut api_check_count = 0usize;
 
             for prefix in &prefixes {
                 results.insert(prefix.clone(), HashMap::new());
 
                 for tld in &tlds {
-                    // Rate limit wait (skip first)
-                    if check_count > 0 {
+                    let domain = format!("{}.{}", prefix, tld);
+
+                    // Short-circuit owned cells: no API call, no rate-limit wait.
+                    if owned_set.contains(&domain.to_lowercase()) {
+                        eprintln!("[owned] {}", domain);
+                        results
+                            .get_mut(prefix)
+                            .unwrap()
+                            .insert(tld.clone(), MatrixCell::Owned);
+                        continue;
+                    }
+
+                    // Rate limit wait (skip before the first actual API call).
+                    if api_check_count > 0 {
                         eprintln!(
                             "[{}/{}] Waiting {}s...",
-                            check_count, total_checks, RATE_LIMIT_WAIT
+                            api_check_count, api_checks, RATE_LIMIT_WAIT
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(RATE_LIMIT_WAIT)).await;
                     }
-                    check_count += 1;
+                    api_check_count += 1;
 
-                    let domain = format!("{}.{}", prefix, tld);
-                    eprintln!("[{}/{}] Checking {}...", check_count, total_checks, domain);
+                    eprintln!(
+                        "[{}/{}] Checking {}...",
+                        api_check_count, api_checks, domain
+                    );
 
                     // Check with retry loop
                     let cell = loop {
@@ -817,5 +866,86 @@ fn truncate(s: &str, max_len: usize) -> String {
         format!("{}...", &s[..max_len - 3])
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_domain(name: &str) -> client::Domain {
+        // Domain has serde_json::Value boolean fields with no Default — construct via serde_json.
+        serde_json::from_value(serde_json::json!({
+            "domain": name,
+            "status": "ACTIVE",
+            "tld": name.rsplit('.').next().unwrap_or(""),
+            "createDate": "2020-01-01 00:00:00",
+            "expireDate": "2030-01-01 00:00:00",
+            "securityLock": "0",
+            "whoisPrivacy": "1",
+            "autoRenew": "1",
+            "notLocal": "0"
+        }))
+        .expect("fake domain JSON should deserialize")
+    }
+
+    #[test]
+    fn matrix_cell_owned_displays_as_owned() {
+        assert_eq!(MatrixCell::Owned.display(), "OWNED");
+    }
+
+    #[test]
+    fn matrix_cell_taken_unchanged() {
+        assert_eq!(MatrixCell::Taken.display(), "TAKEN");
+    }
+
+    #[test]
+    fn matrix_cell_available_unchanged() {
+        let cell = MatrixCell::Available {
+            price: "12.15".to_string(),
+            is_premium: false,
+        };
+        assert_eq!(cell.display(), "$12.15");
+    }
+
+    #[test]
+    fn matrix_cell_available_premium_unchanged() {
+        let cell = MatrixCell::Available {
+            price: "500.00".to_string(),
+            is_premium: true,
+        };
+        assert_eq!(cell.display(), "$500.00 [P]");
+    }
+
+    #[test]
+    fn build_owned_set_lowercases_names() {
+        let domains = vec![fake_domain("CoreyJa.COM"), fake_domain("Example.dev")];
+        let set = build_owned_set(&domains);
+        assert!(set.contains("coreyja.com"));
+        assert!(set.contains("example.dev"));
+        assert!(!set.contains("CoreyJa.COM"));
+    }
+
+    #[test]
+    fn build_owned_set_empty_input() {
+        let set = build_owned_set(&[]);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn owned_lookup_matches_case_insensitively() {
+        let domains = vec![fake_domain("coreyja.com")];
+        let set = build_owned_set(&domains);
+        // Caller lowercases the candidate before lookup.
+        let candidate = format!("{}.{}", "CoreyJa", "COM").to_lowercase();
+        assert!(set.contains(&candidate));
+    }
+
+    #[test]
+    fn owned_lookup_miss_for_unowned() {
+        let domains = vec![fake_domain("coreyja.com")];
+        let set = build_owned_set(&domains);
+        let candidate = format!("{}.{}", "coreyja", "io");
+        assert!(!set.contains(&candidate));
     }
 }
